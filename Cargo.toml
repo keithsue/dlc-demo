@@ -1,0 +1,8 @@
+[package]
+name = "dlc-demo"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+dlc = "0.5.0"
+bitcoin = { version = "0.30.2", default-features = false }
