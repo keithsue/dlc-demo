@@ -31,11 +31,12 @@ fn main() {
     )
     .unwrap();
 
-    let cets = dlc_txs.cets;
+    let mut cets = dlc_txs.cets;
 
     // outcomes and messages which are hashed outcomes
     let outcomes = [true, false];
-    let messages: Vec<Message> = (0..outcomes.len())
+    let messages: Vec<Message> = outcomes
+        .into_iter()
         .map(|o| Message::from_hashed_data::<secp256k1_zkp::hashes::sha256::Hash>(&[o as u8]))
         .collect();
 
@@ -45,32 +46,22 @@ fn main() {
     let secp = Secp256k1::new();
     let mut rng = secp256k1_zkp::rand::thread_rng();
 
+    // key pair
     let oracle_kp = KeyPair::new(&secp, &mut rng);
     let oracle_pubkey = oracle_kp.x_only_public_key().0;
 
-    let oracle_info: OracleInfo;
-    let mut nonces: Vec<XOnlyPublicKey> = Vec::with_capacity(messages.len());
-    let mut sk_nonces: Vec<[u8; 32]> = Vec::with_capacity(messages.len());
-    let mut oracle_sigs: Vec<SchnorrSignature> = Vec::with_capacity(messages.len());
+    // sk nonce
+    let mut sk_nonce = [0u8; 32];
+    rng.fill_bytes(&mut sk_nonce);
 
-    for i in 0..messages.len() {
-        let mut sk_nonce = [0u8; 32];
-        rng.fill_bytes(&mut sk_nonce);
+    // nonce
+    let oracle_r_kp = KeyPair::from_seckey_slice(&secp, &sk_nonce).unwrap();
+    let nonce = XOnlyPublicKey::from_keypair(&oracle_r_kp).0;
 
-        let oracle_r_kp = KeyPair::from_seckey_slice(&secp, &sk_nonce).unwrap();
-        let nonce = XOnlyPublicKey::from_keypair(&oracle_r_kp).0;
-
-        let sig =
-            secp_utils::schnorrsig_sign_with_nonce(&secp, &messages[i], &oracle_kp, &sk_nonce);
-
-        oracle_sigs.push(sig);
-        nonces.push(nonce);
-        sk_nonces.push(sk_nonce);
-    }
-
-    oracle_info = OracleInfo {
+    // oracle info to be published
+    let oracle_info = OracleInfo {
         public_key: oracle_pubkey,
-        nonces,
+        nonces: vec![nonce],
     };
 
     let funding_script_pubkey = make_funding_redeemscript(
@@ -79,49 +70,64 @@ fn main() {
     );
     let fund_output_value = dlc_txs.fund.output[0].value;
 
-    // create adaptor signatures
-    let adaptor_sigs = create_cet_adaptor_sigs_from_oracle_info(
+    // create CET 0 adaptor signature for the accept party
+    let cet_0_adaptor_sig_accept = create_cet_adaptor_sig_from_oracle_info(
         &secp,
-        &cets,
+        &cets[0],
         &[oracle_info.clone()],
-        &offer_fund_sk,
+        &accept_fund_sk,
         &funding_script_pubkey,
         fund_output_value,
-        &[vec![messages.clone()], vec![messages.clone()]],
+        &[vec![messages[0]]],
     )
     .unwrap();
 
-    // sign CET
-    let sign_res = sign_cet(
+    // verify the adaptor signature
+    verify_cet_adaptor_sig_from_oracle_info(
         &secp,
-        &mut cets[0].clone(),
-        &adaptor_sigs[0],
-        &[vec![oracle_sigs[0]]],
+        &cet_0_adaptor_sig_accept,
+        &cets[0],
+        &[oracle_info.clone()],
+        &accept_party_params.fund_pubkey,
+        &funding_script_pubkey,
+        fund_output_value,
+        &[vec![messages[0].clone()]],
+    )
+    .expect("Failed to verify the adaptor signature");
+
+    // oracle publishes the signature of the event outcome
+    // assume the outcome is true(the offer party wins), meaning that messages[0] is to be signed
+    let oracle_sig_for_outcome_0 =
+        secp_utils::schnorrsig_sign_with_nonce(&secp, &messages[0], &oracle_kp, &sk_nonce);
+
+    // sign CET 0 with the offer party's self-signature and the accept party's adaptor signature
+    sign_cet(
+        &secp,
+        &mut cets[0],
+        &cet_0_adaptor_sig_accept,
+        &[vec![oracle_sig_for_outcome_0]],
         &offer_fund_sk,
-        &offer_party_params.fund_pubkey,
+        &accept_party_params.fund_pubkey, // corresponding to adaptor signature
         &funding_script_pubkey,
         fund_output_value,
     )
-    .expect("Failed to sign CET");
+    .expect("Failed to sign CET 0");
 
-    let adaptor_secret = signatures_to_secret(&[vec![oracle_sigs[0]]]).unwrap();
-    let adapted_sig = adaptor_sigs[0].decrypt(&adaptor_secret).unwrap();
+    // decrypt the adaptor signature
+    let adaptor_secret = signatures_to_secret(&[vec![oracle_sig_for_outcome_0]]).unwrap();
+    let adapted_sig = cet_0_adaptor_sig_accept.decrypt(&adaptor_secret).unwrap();
 
-    // verify
-    assert!(adaptor_sigs
-        .iter()
-        .enumerate()
-        .all(|(i, x)| verify_cet_adaptor_sig_from_oracle_info(
-            &secp,
-            x,
-            &cets[i],
-            &[oracle_info.clone()],
-            &offer_party_params.fund_pubkey,
-            &funding_script_pubkey,
-            fund_output_value,
-            &[messages.clone()],
-        )
-        .is_ok()));
+    // verify if the adapted signature is valid against the CET 0
+    verify_tx_input_sig(
+        &secp,
+        &adapted_sig,
+        &cets[0],
+        0,
+        funding_script_pubkey.as_script(),
+        fund_output_value,
+        &accept_party_params.fund_pubkey,
+    )
+    .expect("Decrypted adapted signature is invalid");
 }
 
 fn get_party_params(
